@@ -1,0 +1,260 @@
+---
+title: "Species distribution modellig with maxent: Sundarbans mangrove forest"
+author: "Mohammad Shamim Hasan Mandal"
+date: "2/15/2021"
+geometry: margin=1in
+output: github_document
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+gc()
+library(knitr)
+```
+
+## MaxEnt with dismo package in R
+
+First we load required packages for our analysis. We will use the package 'dismo' for our analysis. Package 'raster' and '' will be used for raster data and vector data. 
+
+```{r echo=FALSE}
+#load packages
+library(sf)
+library(raster)
+library(dismo)
+```
+
+We additionally assign some optional settings for raster package for our analysis. 
+
+```{r include=FALSE}
+# assign increased memory to raster package
+rasterOptions(progress = 'text') # progress will be shown on the console
+rasterOptions(maxmemory = 7e+9)  # increase memory usage
+rasterOptions(tmpdir= 'temp_files')
+```
+### Read species occurance data
+
+This is a csv file with only two columns, the first column is longitude and second column in latitude. Note this order and format is mandatory for MaxEnt. 
+```{r readOccurrencedata}
+# Occurrence data from example dataset
+occ <- read.csv('./data/species.csv')
+str(occ)
+```
+
+### Read environmental variables data
+
+Next we load our predictor variables. This is raster stack with 26 variables. First 19 variables are from [WorldClim data Version 2](https://www.worldclim.org/data/bioclim.html). \
+
+Data variable descriptions:\
+  1. BIO1 = Annual Mean Temperature\
+  2. BIO2 = Mean Diurnal Range (Mean of monthly (max temp - min temp))\
+  3. BIO3 = Isothermality (BIO2/BIO7) (×100)\
+  4. BIO4 = Temperature Seasonality (standard deviation ×100)\
+  5. BIO5 = Max Temperature of Warmest Month\
+  6. BIO6 = Min Temperature of Coldest Month\
+  7. BIO7 = Temperature Annual Range (BIO5-BIO6)\
+  8. BIO8 = Mean Temperature of Wettest Quarter\
+  9. BIO9 = Mean Temperature of Driest Quarter\
+  10. BIO10 = Mean Temperature of Warmest Quarter\
+  11. BIO11 = Mean Temperature of Coldest Quarter\
+  12. BIO12 = Annual Precipitation\
+  13. BIO13 = Precipitation of Wettest Month\
+  14. BIO14 = Precipitation of Driest Month\
+  15. BIO15 = Precipitation Seasonality (Coefficient of Variation)\
+  16. BIO16 = Precipitation of Wettest Quarter\
+  17. BIO17 = Precipitation of Driest Quarter\
+  18. BIO18 = Precipitation of Warmest Quarter\
+  19. BIO19 = Precipitation of Coldest Quarter\
+
+Next three mangrove layers: above ground biomass, maximum caopy height and basal area from ORNL Daac [Simrad et al., 2019](https://doi.org/10.3334/ORNLDAAC/1665).  
+
+'frq_sampled' raster layer is frequency of cyclone impact per pixel from [Mandal and Hosaka et al. 2020](). This is a 30m pixels data, resampled to match worldclim data (~1km).
+
+'swind' and 'wwind' is average wind speed in summer and winter months extracted from windspeed data from WorldClim.
+
+'elv_sampled' is elevation data also downloaded from worldClim. 
+
+Finally the data were stack together using raster package function as 'grd' file format. 
+
+```{r read_raster}
+# read environmental data
+predictors<- stack('./data/predictors_27.grd')
+names(predictors[[23]]) <- 'cy_freq'
+names(predictors[[26]]) <- 'elvation'
+names(predictors[[27]]) <- 'salinity'
+
+# names of predictors
+names(predictors)
+```
+
+### Dropping layers
+For model simplification we will drop four layer from our predictor raster objects
+
+```{r droplayer}
+predictors<-dropLayer(predictors,c("hba_sbn","hmax_sbn","agb_sbn","wwind"))
+
+names(predictors)
+```
+
+### Calculate VIF for all the predictor variables. 
+
+We now test multicolinearity problems among our predicotr variables. We can use vifstep function from the  package 'usdm'. 
+
+The vifsetp function uses two different strategy to exclude highly collinear variable through a stepwise procedure. We set our threshold value to be 10.
+
+```{r warning=FALSE}
+library(usdm)
+# identify collinear variables that should be excluded
+r1 <-brick(predictors)
+v2 <- vifstep(r1,maxobservations=10000, th=10)
+v2
+
+```
+
+
+### Based on our VIF analysis we will use only 11 precitors for our modelling.
+
+```{r}
+predictors<-dropLayer(predictors,
+                      c("bio2_28","bio4_28","bio5_28","bio6_28",
+                        "bio7_28","bio9_28","bio12_28","bio13_28",
+                        "bio16_28","bio17_28","bio18_28","bio19_28"))
+names(predictors)
+```
+
+
+### Data cleaning
+
+For our species occurrence points we will extract environmental variable values. Because we want to know, if there is any species occurrence points for which there is no environmental variables values. We need to remove these occurrences. 
+
+So, first we extract values in a data frame. Then we check whether there is any 'NA' values, 'NA' represents 'not available'.  
+
+```{r NAs_check}
+# check for NA values
+val <- extract(predictors, occ) # extract for each point
+sum(is.na(val))                 # how many NAs
+#which(is.na(x), arr.ind=TRUE) # rows with NA values: 76 and 80
+```
+
+If we had any NA values, we will remove these rows from our dataframe. 
+
+```{r removeRows}
+# remove species with no data
+occ<-occ[-c(76,80),]    # remove rows 76 and 80
+dim(occ)                # Check data  
+
+# finally save to disk
+# write.csv(occ,'species.csv', row.names = F) 
+```
+
+
+### Train and test set
+
+We will divide our occurrence data with train and test sets. We will model with train data and evaluate model performances using test data. Because we will use random sampling, and each time we run random sampling we need to use set.seed() so that next time we get the same output. 
+
+```{r TrainTestSet}
+# Train and test
+set.seed(001)
+# withhold 20% of the data for testing the model
+fold <- kfold(occ, k=5)
+test <- occ[fold == 1, ]
+train <- occ[fold != 1, ]
+```
+
+We check the dimension of our train and test dataset
+
+```{r check}
+# we check dimension of our test and test set
+data.frame(dim(train),dim(test))
+```
+
+### Check species distribution data
+
+```{r VisualMap}
+# Plot the distribution map
+plot(predictors[[10]], xlim=c(88,91),ylim=c(21.4,22.6), 
+     col=terrain.colors(5, rev = F), 
+     main='SBN map with mean elevation and occurance data')
+points(train, pch='+', cex=0.8)
+points(test, pch=20,col='red', cex=0.8)
+```
+
+### Using R dismo package set up first maxent model. 
+
+```{r echo=FALSE,warning=FALSE}
+set.seed(002)
+# Maxent 1 : first model
+library(dismo)
+
+m1 <- maxent(x= predictors,         # predictors
+             p= train,              # occurrence data
+             nbg=10000, 
+             # cyclone affected frequency as categorical variables
+             factors="cy_freq", 
+             args=c("-J", "-P"),
+             outputformat="logistic",
+             path="./model/m1")
+
+```
+
+```{r echo=F}
+set.seed(003)
+# Now use the model data to project
+par(mar=c(4,3,1,1))
+response(m1) # response curves saved to m1response.png
+```
+```{r out.width = "80%"}
+# results of jackknife test
+# import plot saved by maxent() function by default
+include_graphics('./model/m1/plots/species_jacknife.png')
+```
+
+```{r fig.height = 6, fig.width=5}
+# variable importance
+plot(m1) # plot showing importance of each variable
+```
+
+```{r echo=FALSE}
+set.seed(005)
+#testing the model
+bg <- randomPoints(predictors, 20000)  # background data
+```
+
+```{r}
+# evaluate model performance with test data
+e1 <- evaluate(m1, p=test, a=bg, x=predictors)
+e1 # evaluation criteria
+
+```
+
+
+```{r echo=FALSE}
+set.seed(004)
+# Predict
+pred1 <- predict(m1, predictors) 
+```
+
+```{r}
+# check threshold values
+threshold(e1)
+```
+
+```{r}
+# Plot maxent raw values where against predicted presence absence data
+
+plot(pred1, main='Maxent, raw values')
+tr1 <- threshold(e1, 'spec_sens')
+```
+
+
+```{r}
+plot(pred1 > tr1, main='presence/absence')
+points(train, pch='+')
+```
+
+
+```{r fig.width = 5}
+# plot ROC
+plot(e1, 'ROC')
+```
+
+
+### End of the Script
